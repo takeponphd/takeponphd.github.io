@@ -53,6 +53,12 @@ button{font:inherit;color:inherit;border:0;background:none;cursor:pointer}
 #camMsg{position:absolute;inset:0;display:flex;flex-direction:column;gap:12px;align-items:center;
   justify-content:center;text-align:center;padding:24px;color:var(--muted);font-size:14px}
 #camTools{position:absolute;left:10px;bottom:10px;display:flex;gap:8px;z-index:3}
+#tapHint{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);z-index:4;display:none;
+  background:rgba(11,18,32,.8);backdrop-filter:blur(6px);border:1px solid var(--line);
+  border-radius:999px;padding:8px 16px;font-size:13px;font-weight:600;color:#dbe6ff;
+  pointer-events:none;white-space:nowrap;animation:hintPulse 1.8s ease-in-out infinite}
+@keyframes hintPulse{0%,100%{opacity:.85}50%{opacity:1}}
+#viewport.tappable{cursor:pointer}
 #camTools .btn{background:rgba(11,18,32,.72);backdrop-filter:blur(6px)}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;margin-top:12px}
 .card h2{margin:0 0 10px;font-size:13px;letter-spacing:.06em;color:var(--muted);text-transform:uppercase}
@@ -129,6 +135,7 @@ dialog::backdrop{background:rgba(0,0,0,.6);backdrop-filter:blur(3px)}
       <div id="camMsgText">カメラを起動します</div>
       <button class="btn primary" id="btnStart">カメラを開始</button>
     </div>
+    <div id="tapHint">画面をタップで次を読み取る</div>
     <div id="camTools" style="display:none">
       <button class="btn sm" id="btnTorch" style="display:none">💡 ライト</button>
       <button class="btn sm" id="btnSwitch" style="display:none">🔄 カメラ切替</button>
@@ -1453,6 +1460,9 @@ var video = $('video'), frozen = $('frozen'), overlay = $('overlay');
 var work = document.createElement('canvas'), wctx = work.getContext('2d', { willReadFrequently: true });
 var stream = null, scanning = false, rafId = 0, devices = [], devIndex = 0, track = null;
 var current = null, altFrame = false, lastDecodeAt = 0;
+var resumeAt = 0, lastCode = '', lastCodeAt = 0;
+var RESUME_GRACE_MS = 400;      /* keep the live view visible for a moment after resuming */
+var SAME_CODE_COOLDOWN_MS = 2500; /* don't instantly re-fire on the code still in front of the lens */
 
 function camMsg(text, showBtn, btnLabel) {
   $('camMsg').style.display = 'flex';
@@ -1543,6 +1553,7 @@ function scanFrame() {
   if (!scanning) return;
   rafId = requestAnimationFrame(scanFrame);
   var now = Date.now();
+  if (now - resumeAt < RESUME_GRACE_MS) return;
   if (now - lastDecodeAt < 80) return;
   lastDecodeAt = now;
   if (video.readyState < 2) return;
@@ -1554,12 +1565,20 @@ function scanFrame() {
   try { img = wctx.getImageData(0, 0, geo.w, geo.h); } catch (e) { return; }
   var res = null;
   try { res = QR(img.data, img.width, img.height, { maxPasses: 3 }); } catch (e) { res = null; }
-  if (res && res.data) onDetected(res, geo);
+  if (res && res.data) {
+    /* the same code is usually still in view right after resuming - wait for the user to move on */
+    if (res.data === lastCode && Date.now() - lastCodeAt < SAME_CODE_COOLDOWN_MS) return;
+    onDetected(res, geo);
+  }
 }
 
 function resumeScan() {
   current = null;
+  resumeAt = Date.now();
+  lastDecodeAt = Date.now();
   $('resultCard').classList.remove('show');
+  $('tapHint').style.display = 'none';
+  $('viewport').classList.remove('tappable');
   frozen.style.display = 'none';
   video.style.display = '';
   $('reticle').style.display = '';
@@ -1578,6 +1597,8 @@ function freezeFrame(loc, geo) {
   frozen.style.display = 'block';
   video.style.display = 'none';
   $('reticle').style.display = 'none';
+  $('tapHint').style.display = 'block';
+  $('viewport').classList.add('tappable');
 
   var pts = ['topLeft', 'topRight', 'bottomRight', 'bottomLeft'].map(function (k) {
     return { x: loc[k].x * geo.k + geo.sx, y: loc[k].y * geo.k + geo.sy };
@@ -1643,6 +1664,7 @@ function notifyScan() {
 
 function onDetected(res, geo) {
   pauseScan();
+  lastCode = res.data; lastCodeAt = Date.now();
   freezeFrame(res.location, geo);
   notifyScan();
 
@@ -1720,6 +1742,14 @@ function renderEndpoint() {
 /* ---------- buttons ---------- */
 $('btnStart').onclick = function () { startCamera(); };
 $('btnResume').onclick = function () { resumeScan(); };
+
+/* tap anywhere on the frozen camera view to scan the next code */
+$('viewport').addEventListener('click', function (e) {
+  if (e.target.closest && e.target.closest('#camTools')) return;
+  if (e.target.closest && e.target.closest('#camMsg')) return;
+  if (!stream || scanning || !current) return;
+  resumeScan();
+});
 $('btnRetryOne').onclick = function () {
   if (!current) return;
   var it = null;
