@@ -174,6 +174,7 @@ dialog::backdrop{background:rgba(0,0,0,.6);backdrop-filter:blur(3px)}
     <h2>履歴 <span class="badge" id="histCount"></span></h2>
     <ul class="hist" id="hist"></ul>
     <div class="empty" id="histEmpty">まだ読み取りはありません</div>
+    <div class="hint" id="histNote" style="display:none">表示は直近60件。送信済みは24時間で自動削除されます。</div>
     <div class="row" style="margin-top:12px">
       <button class="btn sm" id="btnFlush">未送信を再送</button>
       <button class="btn sm" id="btnCsv">CSV書き出し</button>
@@ -181,7 +182,8 @@ dialog::backdrop{background:rgba(0,0,0,.6);backdrop-filter:blur(3px)}
     </div>
   </div>
   <div class="hint" style="text-align:center;margin-top:18px">
-    読み取りデータはこの端末のブラウザ内（localStorage）にのみ保存されます。
+    読み取りデータはこの端末のブラウザ内（localStorage）にのみ保存されます。<br>
+    送信済みは24時間後に自動削除。未送信は送信できるまで件数・期間に関係なく保持します。
   </div>
 </div>
 
@@ -1295,20 +1297,88 @@ function load(key, def) {
 }
 function save(key, val) {
   var s = JSON.stringify(val);
-  try { if (LS) LS.setItem(key, s); else mem[key] = s; }
-  catch (e) { mem[key] = s; }
+  try { if (LS) LS.setItem(key, s); else mem[key] = s; return true; }
+  catch (e) { mem[key] = s; return false; }
 }
 
-var K_CFG = 'qrpost.config.v1', K_HIST = 'qrpost.history.v1';
-var MAX_HISTORY = 500;
+var K_CFG = 'qrpost.config.v1', K_HIST = 'qrpost.history.v1', K_QUEUE = 'qrpost.queue.v1';
+/* 保持ポリシー: 送信済みは24時間で自動削除。未送信は経過時間にかかわらず削除しない */
+var RETENTION_MS = 24 * 60 * 60 * 1000;
+var PURGE_INTERVAL_MS = 10 * 60 * 1000;
 
 var cfg = Object.assign({
   endpoint: '', headers: '', timeout: 10, autoResume: false, beep: true
 }, load(K_CFG, {}));
-var history = load(K_HIST, []);
+
+/* 履歴は遅延保存、未送信キューは即時保存。
+   起動時は両者をマージして、直前の異常終了で失われた未送信分を拾い直す */
+var history = (function () {
+  var hist = load(K_HIST, []) || [];
+  var queue = load(K_QUEUE, []) || [];
+  if (queue.length) {
+    var byId = {};
+    hist.forEach(function (h) { byId[h.id] = h; });
+    queue.forEach(function (q) {
+      if (byId[q.id]) { byId[q.id].status = q.status; byId[q.id].error = q.error; byId[q.id].http = q.http; }
+      else hist.push(q);
+    });
+    hist.sort(function (a, b) { return Date.parse(b.scannedAt) - Date.parse(a.scannedAt); });
+  }
+  return hist;
+})();
 
 function saveCfg() { save(K_CFG, cfg); }
-function saveHist() { save(K_HIST, history.slice(0, MAX_HISTORY)); }
+
+/* 送信済みかつ24時間以上経過したレコードのみ削除する */
+function purgeExpired() {
+  var cutoff = Date.now() - RETENTION_MS, removed = 0;
+  var kept = [];
+  for (var i = 0; i < history.length; i++) {
+    var it = history[i];
+    if (it.status === 'sent') {
+      var t = Date.parse(it.scannedAt);
+      if (!isNaN(t) && t < cutoff) { removed++; continue; }
+    }
+    kept.push(it);
+  }
+  if (removed) history = kept;
+  return removed;
+}
+
+/* 容量超過時のみ、古い送信済みから段階的に間引いて書き込みを成立させる */
+function writeHistory() {
+  if (save(K_HIST, history)) return true;
+  var work = history.slice();
+  for (var guard = 0; guard < 60; guard++) {
+    var sentIdx = [];
+    for (var i = 0; i < work.length; i++) if (work[i].status === 'sent') sentIdx.push(i);
+    if (!sentIdx.length) break;
+    var drop = Math.max(1, Math.floor(sentIdx.length * 0.1)), kill = {};
+    for (var j = 0; j < drop; j++) kill[sentIdx[sentIdx.length - 1 - j]] = true;
+    var next = [];
+    for (i = 0; i < work.length; i++) if (!kill[i]) next.push(work[i]);
+    work = next;
+    if (save(K_HIST, work)) { history = work; return true; }
+  }
+  return false;
+}
+
+var histTimer = null;
+function saveQueue() {
+  var q = [];
+  for (var i = 0; i < history.length; i++) if (retryable(history[i])) q.push(history[i]);
+  save(K_QUEUE, q);
+}
+/* 未送信キューは即時、全履歴は700msデバウンス（読み取り中のフレーム落ちを防ぐ） */
+function saveHist() {
+  saveQueue();
+  if (histTimer) return;
+  histTimer = setTimeout(function () { histTimer = null; writeHistory(); }, 700);
+}
+function saveHistNow() {
+  if (histTimer) { clearTimeout(histTimer); histTimer = null; }
+  saveQueue(); writeHistory();
+}
 
 /* ---------- small ui helpers ---------- */
 var flashTimer;
@@ -1428,6 +1498,7 @@ var STATUS_CLASS = { sent: 'st-sent', pending: 'st-pending', offline: 'st-failed
 function renderHistory() {
   var ul = $('hist'); ul.innerHTML = '';
   $('histEmpty').style.display = history.length ? 'none' : '';
+  $('histNote').style.display = history.length ? '' : 'none';
   $('histCount').textContent = history.length ? '（' + history.length + '件）' : '';
   history.slice(0, 60).forEach(function (it) {
     var li = document.createElement('li');
@@ -1675,7 +1746,7 @@ function onDetected(res, geo) {
   };
   current = item;
   history.unshift(item);
-  if (history.length > MAX_HISTORY) history.length = MAX_HISTORY;
+  purgeExpired();
   saveHist();
 
   $('resultCard').classList.add('show');
@@ -1782,17 +1853,20 @@ $('btnCsv').onclick = function () {
 $('btnClear').onclick = function () {
   if (!history.length) return;
   if (!confirm('履歴をすべて消去します。よろしいですか？')) return;
-  history = []; current = null; saveHist(); renderHistory(); ensureRetryLoop();
+  history = []; current = null; saveHistNow(); renderHistory(); ensureRetryLoop();
   $('resultCard').classList.remove('show');
   flash('履歴を消去しました');
 };
 
 document.addEventListener('visibilitychange', function () {
-  if (document.hidden) pauseScan();
-  else if (stream && !current) resumeScan();
+  if (document.hidden) { pauseScan(); saveHistNow(); }
+  else { if (purgeExpired()) { saveHistNow(); renderHistory(); } if (stream && !current) resumeScan(); }
 });
+window.addEventListener('pagehide', saveHistNow);
+setInterval(function () { if (purgeExpired()) { saveHistNow(); renderHistory(); } }, PURGE_INTERVAL_MS);
 
 /* ---------- boot ---------- */
+if (purgeExpired()) saveHistNow();
 renderEndpoint();
 renderHistory();
 renderNet();
